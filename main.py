@@ -17,8 +17,13 @@ Required environment variables (see .env.example):
 """
 
 import os
+import io
+import asyncio
 import logging
+import urllib.request
 from typing import List, Optional
+
+from PIL import Image
 
 from dotenv import load_dotenv
 load_dotenv()  # reads .env in the same folder and sets the env vars automatically
@@ -298,18 +303,48 @@ class SendPhotoRequest(BaseModel):
     caption: str = ""
     entities: Optional[List[EmojiEntity]] = []
 
+def _fetch_as_jpeg(url: str) -> io.BytesIO:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = r.read()
+    img = Image.open(io.BytesIO(data))
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGBA")
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        img = bg
+    else:
+        img = img.convert("RGB")
+    img.thumbnail((2560, 2560))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92)
+    buf.seek(0)
+    buf.name = "photo.jpg"
+    return buf
+
+
 @app.post("/send-photo", response_model=SendMessageResponse)
 async def send_photo(payload: SendPhotoRequest, x_api_key: Optional[str] = Header(default=None)):
     _check_api_key(x_api_key)
     tl_entities = _build_entities(payload.entities or [])
     try:
+        # Telethon sends .webp URLs as STICKERS (no caption allowed), so always
+        # download + re-encode to JPEG to guarantee a real photo with caption.
+        try:
+            photo = await asyncio.to_thread(_fetch_as_jpeg, payload.photo_url)
+        except Exception as e:
+            logger.exception("Failed to download/convert photo_url=%s", payload.photo_url)
+            raise HTTPException(status_code=400, detail=f"Could not fetch/convert photo_url: {e}")
         message = await client.send_file(
             _resolve_chat_id(payload.chat_id),
-            file=payload.photo_url,
+            file=photo,
+            force_document=False,
             caption=payload.caption,
             formatting_entities=tl_entities or None,
         )
         return SendMessageResponse(success=True, message_id=message.id)
+    except HTTPException:
+        raise
     except ValueError as e:
         if "Cannot find any entity" in str(e):
             logger.error("Entity resolution failed for chat_id=%s: %s", payload.chat_id, e)
